@@ -120,4 +120,16 @@ class TraktAuthRepositoryTest {
         assertEquals("GG_HeGCytpTZ3yzFxdZ-bnwMgBPzpE0_u8YkQoyM9Lw", TraktAuthRepository.DEFAULT_TRAKT_CLIENT_ID)
         assertEquals("https://auth.trakt.tv/activate", TraktAuthRepository.DEFAULT_VERIFICATION_URL)
     }
+
+    @Test
+    fun `device grant rejects unusable codes expiry intervals and activation origins`() {
+        val valid = TraktDeviceCodeResponse("device", "USER1234", "https://auth.trakt.tv/activate", 600, 5)
+        assertTrue(valid.isValidForSignIn())
+        assertFalse(valid.copy(deviceCode = " ").isValidForSignIn())
+        assertFalse(valid.copy(userCode = "").isValidForSignIn())
+        assertFalse(valid.copy(expiresIn = -1).isValidForSignIn())
+        assertFalse(valid.copy(interval = Int.MAX_VALUE).isValidForSignIn())
+        assertFalse(valid.copy(verificationUrl = "https://example.com/activate").isValidForSignIn())
+        assertFalse(valid.copy(verificationUrl = "http://auth.trakt.tv/activate").isValidForSignIn())
+    }
 }

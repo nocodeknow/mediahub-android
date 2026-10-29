@@ -31,15 +31,18 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-37.1" "build-tools;37.0.0"
+
       - name: Prepare runtime properties
         run: |
           touch local.properties
 
       - name: Run targeted tests
-        run: ./gradlew :composeApp:testDebugUnitTest --tests "com.nuvio.app.features.trakt.*" -Dorg.gradle.jvmargs="-Xmx3584M -XX:MaxMetaspaceSize=1024M" --max-workers=2 --stacktrace
+        run: ./gradlew :composeApp:testAndroidHostTest --tests "com.nuvio.app.features.trakt.*" -Dorg.gradle.jvmargs="-Xmx3584M -XX:MaxMetaspaceSize=1024M" --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process --stacktrace
 
       - name: Build fullDebug APK
-        run: ./gradlew :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore -Dorg.gradle.jvmargs="-Xmx3584M -XX:MaxMetaspaceSize=1024M" --max-workers=2 --stacktrace
+        run: ./gradlew :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore -Dorg.gradle.jvmargs="-Xmx3584M -XX:MaxMetaspaceSize=1024M" --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process --stacktrace
 
       - name: Upload fullDebug APK
         uses: actions/upload-artifact@v7

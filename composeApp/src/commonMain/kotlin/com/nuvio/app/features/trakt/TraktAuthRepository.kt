@@ -133,7 +133,11 @@ object TraktAuthRepository : TrackingAuthProvider {
     fun setCustomClientId(clientId: String, profileId: Int = currentProfileId) {
         ensureLoaded(profileId)
         val trimmed = clientId.trim().ifBlank { null }
-        authState = authState.copy(customClientId = trimmed)
+        if (authState.customClientId == trimmed) return
+        profileGeneration += 1L
+        activePollingJob?.cancel()
+        activePollingJob = null
+        authState = TraktAuthState(customClientId = trimmed)
         persist(profileId)
         publish()
     }
@@ -151,6 +155,7 @@ object TraktAuthRepository : TrackingAuthProvider {
             return null
         }
 
+        profileGeneration += 1L
         val targetProfileId = profileId
         val targetGeneration = profileGeneration
         publish(isLoading = true, errorMessage = null, statusMessage = null)
@@ -194,7 +199,7 @@ object TraktAuthRepository : TrackingAuthProvider {
             log.w { "Failed to parse Trakt device code response: ${it.message}" }
         }.getOrNull()
 
-        if (parsed == null) {
+        if (parsed == null || !parsed.isValidForSignIn()) {
             publish(
                 isLoading = false,
                 errorMessage = localizedString(Res.string.trakt_invalid_token_response),
@@ -304,7 +309,7 @@ object TraktAuthRepository : TrackingAuthProvider {
                         json.decodeFromString<TraktTokenResponse>(response.body)
                     }.getOrNull()
 
-                    if (parsed != null) {
+                    if (parsed != null && parsed.accessToken.isNotBlank() && parsed.refreshToken.isNotBlank() && parsed.expiresIn > 0) {
                         authState = authState.copy(
                             accessToken = parsed.accessToken,
                             refreshToken = parsed.refreshToken,
@@ -321,6 +326,7 @@ object TraktAuthRepository : TrackingAuthProvider {
                         )
                         persist(targetProfileId)
                         refreshUserSettings(targetProfileId)
+                        if (currentProfileId != targetProfileId || profileGeneration != targetGeneration) return
                         publish(
                             isLoading = false,
                             statusMessage = localizedString(Res.string.trakt_connected_status),
@@ -393,6 +399,7 @@ object TraktAuthRepository : TrackingAuthProvider {
 
     fun onCancelAuthorization(profileId: Int = ProfileRepository.activeProfileId) {
         ensureLoaded(profileId)
+        profileGeneration += 1L
         activePollingJob?.cancel()
         activePollingJob = null
         clearDeviceCode()
@@ -434,6 +441,8 @@ object TraktAuthRepository : TrackingAuthProvider {
     suspend fun refreshUserSettings(profileId: Int = currentProfileId): String? {
         ensureLoaded(profileId)
         val headers = authorizedHeaders(profileId) ?: return null
+        val generation = profileGeneration
+        val token = authState.accessToken
         val response = runCatching {
             httpGetTextWithHeaders(
                 url = "$BASE_URL/users/settings",
@@ -448,6 +457,7 @@ object TraktAuthRepository : TrackingAuthProvider {
             json.decodeFromString<TraktUserSettingsResponse>(response)
         }.getOrNull() ?: return null
 
+        if (currentProfileId != profileId || profileGeneration != generation || authState.accessToken != token) return null
         authState = authState.copy(
             username = parsed.user?.username,
             userSlug = parsed.user?.ids?.slug,
@@ -459,55 +469,32 @@ object TraktAuthRepository : TrackingAuthProvider {
 
     fun onDisconnectRequested(profileId: Int = currentProfileId) {
         ensureLoaded(profileId)
-        activePollingJob?.cancel()
-        activePollingJob = null
-        scope.launch {
-            disconnect(profileId)
-        }
-    }
-
-    private suspend fun disconnect(profileId: Int = currentProfileId) {
-        publish(isLoading = true, errorMessage = null)
-
         val token = authState.accessToken?.takeIf { it.isNotBlank() }
         val clientId = getEffectiveClientId(profileId)
-        if (!token.isNullOrBlank() && clientId.isNotBlank()) {
-            val body = json.encodeToString(
-                TraktRevokeRequest(
-                    token = token,
-                    clientId = clientId,
-                ),
-            )
-            runCatching {
-                httpRequestRaw(
-                    method = "POST",
-                    url = "$BASE_URL/oauth/revoke",
-                    body = body,
-                    headers = mapOf(
-                        "Accept" to "application/json",
-                        "Content-Type" to "application/json",
-                        "trakt-api-version" to API_VERSION,
-                        "trakt-api-key" to clientId,
-                    ),
-                )
-            }.onFailure { error ->
-                if (error is CancellationException) throw error
-                log.w { "Failed to revoke Trakt token: ${error.message}" }
-            }
-        }
-
-        // Clear session tokens but preserve customClientId
+        profileGeneration += 1L
+        activePollingJob?.cancel()
+        activePollingJob = null
         authState = TraktAuthState(customClientId = authState.customClientId)
         persist(profileId)
-        publish(
-            isLoading = false,
-            statusMessage = localizedString(Res.string.trakt_disconnected_status),
-            errorMessage = null,
-        )
+        publish(isLoading = false, errorMessage = null,
+            statusMessage = localizedString(Res.string.trakt_disconnected_status))
+        // Revoke the captured device grant; a late response must not mutate current state.
+        if (token != null) scope.launch {
+            try {
+                httpRequestRaw(method = "POST", url = "$BASE_URL/oauth/revoke",
+                    body = json.encodeToString(TraktRevokeRequest(token = token, clientId = clientId)),
+                    headers = mapOf("Content-Type" to "application/json", "Accept" to "application/json"))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                log.w { "Unable to revoke disconnected device grant remotely" }
+            }
+        }
     }
 
     private suspend fun refreshTokenIfNeeded(force: Boolean, profileId: Int = currentProfileId): Boolean = refreshMutex.withLock {
         val clientId = getEffectiveClientId(profileId)
+        val generation = profileGeneration
         if (clientId.isBlank()) return@withLock false
         val refreshToken = authState.refreshToken?.takeIf { it.isNotBlank() }
             ?: return@withLock false
@@ -540,7 +527,7 @@ object TraktAuthRepository : TrackingAuthProvider {
             log.w { "Trakt token refresh transport failure: ${error.message}" }
         }.getOrNull() ?: return@withLock false
 
-        if (ProfileRepository.activeProfileId != profileId || authState.refreshToken != refreshToken) {
+        if (currentProfileId != profileId || profileGeneration != generation || authState.refreshToken != refreshToken) {
             return@withLock false
         }
 
@@ -562,6 +549,7 @@ object TraktAuthRepository : TrackingAuthProvider {
         val parsed = runCatching {
             json.decodeFromString<TraktTokenResponse>(response.body)
         }.getOrNull() ?: return@withLock false
+        if (parsed.accessToken.isBlank() || parsed.refreshToken.isBlank() || parsed.expiresIn <= 0) return@withLock false
 
         authState = authState.copy(
             accessToken = parsed.accessToken,
@@ -588,6 +576,8 @@ object TraktAuthRepository : TrackingAuthProvider {
     }
 
     private fun loadFromDisk(profileId: Int) {
+        activePollingJob?.cancel()
+        activePollingJob = null
         currentProfileId = profileId
         profileGeneration += 1L
         hasLoaded = true
@@ -601,7 +591,10 @@ object TraktAuthRepository : TrackingAuthProvider {
                     TraktAuthState()
                 }
         }
-        publish(statusMessage = null, errorMessage = null)
+        // Pending grants have no running poller after process/profile restoration.
+        clearDeviceCode()
+        persist(profileId)
+        publish(isLoading = false, statusMessage = null, errorMessage = null)
     }
 
     private fun clearDeviceCode() {

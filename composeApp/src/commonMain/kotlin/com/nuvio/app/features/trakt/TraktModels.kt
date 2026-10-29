@@ -121,3 +121,8 @@ data class TraktMembershipSnapshot(
 data class TraktMembershipChanges(
     val desiredMembership: Map<String, Boolean>,
 )
+
+internal fun TraktDeviceCodeResponse.isValidForSignIn(): Boolean =
+    deviceCode.isNotBlank() && userCode.isNotBlank() &&
+        expiresIn in 1..3600 && interval in 1..300 &&
+        verificationUrl in setOf("https://auth.trakt.tv/activate", "https://trakt.tv/activate")
