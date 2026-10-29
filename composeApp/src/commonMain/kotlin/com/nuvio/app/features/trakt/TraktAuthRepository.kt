@@ -2,7 +2,6 @@ package com.nuvio.app.features.trakt
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.httpGetTextWithHeaders
-import com.nuvio.app.features.addons.httpPostJsonWithHeaders
 import com.nuvio.app.features.addons.httpRequestRaw
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.tracking.TrackingAuthProvider
@@ -10,16 +9,19 @@ import com.nuvio.app.features.tracking.TrackingCapability
 import com.nuvio.app.features.tracking.TrackingProviderDescriptor
 import com.nuvio.app.features.tracking.TrackingProviderId
 import com.nuvio.app.features.tracking.TrackingProviderRegistry
-import io.ktor.http.Url
-import io.ktor.http.encodeURLParameter
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerialName
@@ -27,15 +29,14 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlin.random.Random
 import nuvio.composeapp.generated.resources.*
-import org.jetbrains.compose.resources.getString
 import org.jetbrains.compose.resources.StringResource
-import kotlinx.coroutines.runBlocking
+import org.jetbrains.compose.resources.getString
 
 object TraktAuthRepository : TrackingAuthProvider {
+    const val DEFAULT_TRAKT_CLIENT_ID = "GG_HeGCytpTZ3yzFxdZ-bnwMgBPzpE0_u8YkQoyM9Lw"
+    const val DEFAULT_VERIFICATION_URL = "https://auth.trakt.tv/activate"
     private const val BASE_URL = "https://api.trakt.tv"
-    private const val AUTHORIZE_URL = "https://trakt.tv/oauth/authorize"
     private const val API_VERSION = "2"
 
     private val log = Logger.withTag("TraktAuth")
@@ -45,6 +46,7 @@ object TraktAuthRepository : TrackingAuthProvider {
     }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val refreshMutex = Mutex()
+    private var activePollingJob: Job? = null
 
     private val _uiState = MutableStateFlow(TraktAuthUiState())
     val uiState: StateFlow<TraktAuthUiState> = _uiState.asStateFlow()
@@ -92,10 +94,14 @@ object TraktAuthRepository : TrackingAuthProvider {
     }
 
     fun onProfileChanged(profileId: Int) {
+        activePollingJob?.cancel()
+        activePollingJob = null
         loadFromDisk(profileId)
     }
 
     override fun clearLocalState() {
+        activePollingJob?.cancel()
+        activePollingJob = null
         TraktWatchedShowSnapshotRepository.clear()
         hasLoaded = false
         currentProfileId = 1
@@ -105,6 +111,10 @@ object TraktAuthRepository : TrackingAuthProvider {
     }
 
     override fun removeStoredProfile(profileId: Int) {
+        if (currentProfileId == profileId) {
+            activePollingJob?.cancel()
+            activePollingJob = null
+        }
         TraktAuthStorage.removeProfile(profileId)
     }
 
@@ -113,41 +123,281 @@ object TraktAuthRepository : TrackingAuthProvider {
         return _uiState.value
     }
 
-    fun hasRequiredCredentials(): Boolean =
-        TraktConfig.CLIENT_ID.isNotBlank() && TraktConfig.CLIENT_SECRET.isNotBlank()
-
-    fun onConnectRequested(profileId: Int = ProfileRepository.activeProfileId): String? {
+    fun getEffectiveClientId(profileId: Int = currentProfileId): String {
         ensureLoaded(profileId)
-        if (!hasRequiredCredentials()) {
+        return authState.customClientId?.trim()?.ifBlank { null }
+            ?: TraktConfig.CLIENT_ID.trim().ifBlank { null }
+            ?: DEFAULT_TRAKT_CLIENT_ID
+    }
+
+    fun setCustomClientId(clientId: String, profileId: Int = currentProfileId) {
+        ensureLoaded(profileId)
+        val trimmed = clientId.trim().ifBlank { null }
+        authState = authState.copy(customClientId = trimmed)
+        persist(profileId)
+        publish()
+    }
+
+    fun hasRequiredCredentials(): Boolean = getEffectiveClientId().isNotBlank()
+
+    suspend fun onConnectRequested(profileId: Int = ProfileRepository.activeProfileId): String? {
+        ensureLoaded(profileId)
+        activePollingJob?.cancel()
+        activePollingJob = null
+
+        val clientId = getEffectiveClientId(profileId)
+        if (clientId.isBlank()) {
             publish(errorMessage = localizedString(Res.string.trakt_missing_credentials))
             return null
         }
 
-        val oauthState = generateOauthState()
-        authState = authState.copy(
-            pendingAuthorizationState = oauthState,
-            pendingAuthorizationStartedAtMillis = TraktPlatformClock.nowEpochMs(),
+        val targetProfileId = profileId
+        val targetGeneration = profileGeneration
+        publish(isLoading = true, errorMessage = null, statusMessage = null)
+
+        val body = json.encodeToString(
+            TraktDeviceCodeRequest(clientId = clientId)
         )
-        persist(profileId)
+
+        val response = runCatching {
+            httpRequestRaw(
+                method = "POST",
+                url = "$BASE_URL/oauth/device/code",
+                body = body,
+                headers = mapOf(
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json",
+                    "trakt-api-version" to API_VERSION,
+                    "trakt-api-key" to clientId,
+                ),
+            )
+        }.onFailure { error ->
+            if (error is CancellationException) throw error
+            log.w { "Failed to initiate Trakt device code: ${error.message}" }
+        }.getOrNull()
+
+        if (currentProfileId != targetProfileId || profileGeneration != targetGeneration) {
+            return null
+        }
+
+        if (response == null || response.status !in 200..299) {
+            publish(
+                isLoading = false,
+                errorMessage = localizedString(Res.string.trakt_sign_in_complete_failed),
+            )
+            return null
+        }
+
+        val parsed = runCatching {
+            json.decodeFromString<TraktDeviceCodeResponse>(response.body)
+        }.onFailure {
+            log.w { "Failed to parse Trakt device code response: ${it.message}" }
+        }.getOrNull()
+
+        if (parsed == null) {
+            publish(
+                isLoading = false,
+                errorMessage = localizedString(Res.string.trakt_invalid_token_response),
+            )
+            return null
+        }
+
+        val now = TraktPlatformClock.nowEpochMs()
+        val expiresAtMillis = now + (parsed.expiresIn * 1000L)
+
+        authState = authState.copy(
+            deviceCode = parsed.deviceCode,
+            userCode = parsed.userCode,
+            verificationUrl = parsed.verificationUrl,
+            intervalSeconds = parsed.interval,
+            deviceCodeExpiresAtMillis = expiresAtMillis,
+            pendingAuthorizationStartedAtMillis = now,
+        )
+        persist(targetProfileId)
         publish(
-            statusMessage = localizedString(Res.string.trakt_complete_sign_in_browser),
+            isLoading = false,
+            statusMessage = "Enter code ${parsed.userCode} at ${parsed.verificationUrl}",
             errorMessage = null,
         )
 
-        return buildAuthorizationUrl(oauthState)
+        activePollingJob = scope.launch {
+            pollDeviceTokenLoop(
+                targetProfileId = targetProfileId,
+                targetGeneration = targetGeneration,
+                deviceCode = parsed.deviceCode,
+                initialInterval = parsed.interval,
+                expiresAtMillis = expiresAtMillis,
+            )
+        }
+
+        return parsed.verificationUrl
+    }
+
+    private suspend fun pollDeviceTokenLoop(
+        targetProfileId: Int,
+        targetGeneration: Long,
+        deviceCode: String,
+        initialInterval: Int,
+        expiresAtMillis: Long,
+    ) {
+        var pollIntervalSeconds = maxOf(initialInterval, 1)
+        val maxPollDurationMs = 15 * 60 * 1000L
+        val loopStartedAt = TraktPlatformClock.nowEpochMs()
+
+        while (currentCoroutineContext().isActive) {
+            delay(pollIntervalSeconds * 1000L)
+            if (!currentCoroutineContext().isActive) break
+
+            // Guard: profile switched or state reset
+            if (currentProfileId != targetProfileId || profileGeneration != targetGeneration) break
+
+            // Guard: cancelled or authenticated
+            if (authState.deviceCode != deviceCode || authState.isAuthenticated) break
+
+            val now = TraktPlatformClock.nowEpochMs()
+            if (now >= expiresAtMillis || (now - loopStartedAt) >= maxPollDurationMs) {
+                clearDeviceCode()
+                persist(targetProfileId)
+                publish(
+                    isLoading = false,
+                    errorMessage = "Sign-in code expired. Please restart the sign-in process.",
+                )
+                break
+            }
+
+            val clientId = getEffectiveClientId(targetProfileId)
+            val body = json.encodeToString(
+                TraktDeviceTokenRequest(
+                    code = deviceCode,
+                    clientId = clientId,
+                )
+            )
+
+            val response = runCatching {
+                httpRequestRaw(
+                    method = "POST",
+                    url = "$BASE_URL/oauth/device/token",
+                    body = body,
+                    headers = mapOf(
+                        "Accept" to "application/json",
+                        "Content-Type" to "application/json",
+                        "trakt-api-version" to API_VERSION,
+                        "trakt-api-key" to clientId,
+                    ),
+                )
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                log.w { "Trakt device token poll network failure: ${error.message}" }
+            }.getOrNull()
+
+            if (!currentCoroutineContext().isActive) break
+            if (currentProfileId != targetProfileId || profileGeneration != targetGeneration) break
+            if (authState.deviceCode != deviceCode || authState.isAuthenticated) break
+
+            if (response == null) {
+                continue
+            }
+
+            when (classifyTraktDeviceTokenStatus(response.status)) {
+                TraktDeviceTokenPollResult.SUCCESS -> {
+                    val parsed = runCatching {
+                        json.decodeFromString<TraktTokenResponse>(response.body)
+                    }.getOrNull()
+
+                    if (parsed != null) {
+                        authState = authState.copy(
+                            accessToken = parsed.accessToken,
+                            refreshToken = parsed.refreshToken,
+                            tokenType = parsed.tokenType,
+                            createdAt = parsed.createdAt,
+                            expiresIn = parsed.expiresIn,
+                            deviceCode = null,
+                            userCode = null,
+                            verificationUrl = null,
+                            intervalSeconds = null,
+                            deviceCodeExpiresAtMillis = null,
+                            pendingAuthorizationStartedAtMillis = null,
+                            pendingAuthorizationState = null,
+                        )
+                        persist(targetProfileId)
+                        refreshUserSettings(targetProfileId)
+                        publish(
+                            isLoading = false,
+                            statusMessage = localizedString(Res.string.trakt_connected_status),
+                            errorMessage = null,
+                        )
+                    } else {
+                        clearDeviceCode()
+                        persist(targetProfileId)
+                        publish(
+                            isLoading = false,
+                            errorMessage = localizedString(Res.string.trakt_invalid_token_response),
+                        )
+                    }
+                    break
+                }
+                TraktDeviceTokenPollResult.PENDING -> {
+                    // Continue polling next cycle
+                }
+                TraktDeviceTokenPollResult.SLOW_DOWN -> {
+                    pollIntervalSeconds += 5
+                }
+                TraktDeviceTokenPollResult.EXPIRED -> {
+                    clearDeviceCode()
+                    persist(targetProfileId)
+                    publish(
+                        isLoading = false,
+                        errorMessage = "Sign-in code expired. Please restart the sign-in process.",
+                    )
+                    break
+                }
+                TraktDeviceTokenPollResult.DENIED -> {
+                    clearDeviceCode()
+                    persist(targetProfileId)
+                    publish(
+                        isLoading = false,
+                        errorMessage = localizedString(Res.string.trakt_authorization_denied),
+                    )
+                    break
+                }
+                TraktDeviceTokenPollResult.INVALID_CODE -> {
+                    clearDeviceCode()
+                    persist(targetProfileId)
+                    publish(
+                        isLoading = false,
+                        errorMessage = "Invalid authorization code.",
+                    )
+                    break
+                }
+                TraktDeviceTokenPollResult.ALREADY_USED -> {
+                    clearDeviceCode()
+                    persist(targetProfileId)
+                    publish(
+                        isLoading = false,
+                        errorMessage = "Authorization code was already used.",
+                    )
+                    break
+                }
+                TraktDeviceTokenPollResult.TRANSIENT_ERROR -> {
+                    // Transient error, continue polling
+                }
+            }
+        }
     }
 
     fun pendingAuthorizationUrl(profileId: Int = ProfileRepository.activeProfileId): String? {
         ensureLoaded(profileId)
-        val oauthState = authState.pendingAuthorizationState ?: return null
-        return buildAuthorizationUrl(oauthState)
+        return authState.verificationUrl?.takeIf(String::isNotBlank)
+            ?: if (!authState.deviceCode.isNullOrBlank()) DEFAULT_VERIFICATION_URL else null
     }
 
     fun onCancelAuthorization(profileId: Int = ProfileRepository.activeProfileId) {
         ensureLoaded(profileId)
-        clearPendingAuthorization()
+        activePollingJob?.cancel()
+        activePollingJob = null
+        clearDeviceCode()
         persist(profileId)
-        publish(statusMessage = null, errorMessage = null)
+        publish(statusMessage = null, errorMessage = null, isLoading = false)
     }
 
     fun onCancelDeviceFlow(profileId: Int = ProfileRepository.activeProfileId) {
@@ -159,27 +409,10 @@ object TraktAuthRepository : TrackingAuthProvider {
     }
 
     fun onAuthCallbackReceived(callbackUrl: String) {
-        val profileId = ProfileRepository.activeProfileId
-        ensureLoaded(profileId)
-        if (!callbackUrl.startsWith("${TraktConfig.REDIRECT_URI}?", ignoreCase = true) &&
-            !callbackUrl.equals(TraktConfig.REDIRECT_URI, ignoreCase = true)
-        ) {
-            return
-        }
-
-        scope.launch {
-            completeAuthorizationFromCallback(callbackUrl, profileId)
-        }
+        // No-op for direct device flow
     }
 
-    override fun handleAuthCallback(url: String): Boolean {
-        if (!isTraktAuthCallback(url)) return false
-        onAuthCallbackReceived(url)
-        return true
-    }
-
-    private fun isTraktAuthCallback(url: String): Boolean =
-        url == TraktConfig.REDIRECT_URI || url.startsWith("${TraktConfig.REDIRECT_URI}?")
+    override fun handleAuthCallback(url: String): Boolean = false
 
     suspend fun authorizedHeaders(profileId: Int = currentProfileId): Map<String, String>? {
         ensureLoaded(profileId)
@@ -193,7 +426,7 @@ object TraktAuthRepository : TrackingAuthProvider {
 
         return mapOf(
             "trakt-api-version" to API_VERSION,
-            "trakt-api-key" to TraktConfig.CLIENT_ID,
+            "trakt-api-key" to getEffectiveClientId(profileId),
             "Authorization" to "Bearer $accessToken",
         )
     }
@@ -226,143 +459,36 @@ object TraktAuthRepository : TrackingAuthProvider {
 
     fun onDisconnectRequested(profileId: Int = currentProfileId) {
         ensureLoaded(profileId)
+        activePollingJob?.cancel()
+        activePollingJob = null
         scope.launch {
             disconnect(profileId)
         }
-    }
-
-    private suspend fun completeAuthorizationFromCallback(callbackUrl: String, profileId: Int = currentProfileId) {
-        publish(isLoading = true, errorMessage = null)
-
-        val parsedUrl = runCatching { Url(callbackUrl) }
-            .onFailure {
-                log.w { "Invalid Trakt callback URL: ${it.message}" }
-            }
-            .getOrNull()
-
-        if (parsedUrl == null) {
-            clearPendingAuthorization()
-            persist(profileId)
-            publish(
-                isLoading = false,
-                errorMessage = localizedString(Res.string.trakt_invalid_callback),
-            )
-            return
-        }
-
-        val errorCode = parsedUrl.parameters["error"]
-        if (!errorCode.isNullOrBlank()) {
-            val errorDescription = parsedUrl.parameters["error_description"]
-                ?: localizedString(Res.string.trakt_authorization_denied)
-            clearPendingAuthorization()
-            persist(profileId)
-            publish(
-                isLoading = false,
-                errorMessage = errorDescription,
-            )
-            return
-        }
-
-        val code = parsedUrl.parameters["code"].orEmpty().trim()
-        if (code.isBlank()) {
-            clearPendingAuthorization()
-            persist(profileId)
-            publish(
-                isLoading = false,
-                errorMessage = localizedString(Res.string.trakt_missing_auth_code),
-            )
-            return
-        }
-
-        val expectedState = authState.pendingAuthorizationState
-        val callbackState = parsedUrl.parameters["state"].orEmpty().trim()
-        if (!expectedState.isNullOrBlank() && callbackState != expectedState) {
-            clearPendingAuthorization()
-            persist(profileId)
-            publish(
-                isLoading = false,
-                errorMessage = localizedString(Res.string.trakt_invalid_callback_state),
-            )
-            return
-        }
-
-        exchangeAuthorizationCode(code, profileId)
-    }
-
-    private suspend fun exchangeAuthorizationCode(code: String, profileId: Int = currentProfileId) {
-        val body = json.encodeToString(
-            TraktAuthorizationCodeRequest(
-                code = code,
-                clientId = TraktConfig.CLIENT_ID,
-                clientSecret = TraktConfig.CLIENT_SECRET,
-                redirectUri = TraktConfig.REDIRECT_URI,
-            ),
-        )
-
-        val response = runCatching {
-            httpPostJsonWithHeaders(
-                url = "$BASE_URL/oauth/token",
-                body = body,
-                headers = emptyMap(),
-            )
-        }.onFailure { error ->
-            if (error is CancellationException) throw error
-            log.w { "Failed to exchange Trakt auth code: ${error.message}" }
-        }.getOrNull()
-
-        if (response == null) {
-            clearPendingAuthorization()
-            persist(profileId)
-            publish(isLoading = false, errorMessage = localizedString(Res.string.trakt_sign_in_complete_failed))
-            return
-        }
-
-        val parsed = runCatching {
-            json.decodeFromString<TraktTokenResponse>(response)
-        }.getOrNull()
-
-        if (parsed == null) {
-            clearPendingAuthorization()
-            persist(profileId)
-            publish(isLoading = false, errorMessage = localizedString(Res.string.trakt_invalid_token_response))
-            return
-        }
-
-        authState = authState.copy(
-            accessToken = parsed.accessToken,
-            refreshToken = parsed.refreshToken,
-            tokenType = parsed.tokenType,
-            createdAt = parsed.createdAt,
-            expiresIn = parsed.expiresIn,
-            pendingAuthorizationState = null,
-            pendingAuthorizationStartedAtMillis = null,
-        )
-        persist(profileId)
-        refreshUserSettings(profileId)
-        publish(
-            isLoading = false,
-            statusMessage = localizedString(Res.string.trakt_connected_status),
-            errorMessage = null,
-        )
     }
 
     private suspend fun disconnect(profileId: Int = currentProfileId) {
         publish(isLoading = true, errorMessage = null)
 
         val token = authState.accessToken?.takeIf { it.isNotBlank() }
-        if (!token.isNullOrBlank() && hasRequiredCredentials()) {
+        val clientId = getEffectiveClientId(profileId)
+        if (!token.isNullOrBlank() && clientId.isNotBlank()) {
             val body = json.encodeToString(
                 TraktRevokeRequest(
                     token = token,
-                    clientId = TraktConfig.CLIENT_ID,
-                    clientSecret = TraktConfig.CLIENT_SECRET,
+                    clientId = clientId,
                 ),
             )
             runCatching {
-                httpPostJsonWithHeaders(
+                httpRequestRaw(
+                    method = "POST",
                     url = "$BASE_URL/oauth/revoke",
                     body = body,
-                    headers = emptyMap(),
+                    headers = mapOf(
+                        "Accept" to "application/json",
+                        "Content-Type" to "application/json",
+                        "trakt-api-version" to API_VERSION,
+                        "trakt-api-key" to clientId,
+                    ),
                 )
             }.onFailure { error ->
                 if (error is CancellationException) throw error
@@ -370,7 +496,8 @@ object TraktAuthRepository : TrackingAuthProvider {
             }
         }
 
-        authState = TraktAuthState()
+        // Clear session tokens but preserve customClientId
+        authState = TraktAuthState(customClientId = authState.customClientId)
         persist(profileId)
         publish(
             isLoading = false,
@@ -380,7 +507,8 @@ object TraktAuthRepository : TrackingAuthProvider {
     }
 
     private suspend fun refreshTokenIfNeeded(force: Boolean, profileId: Int = currentProfileId): Boolean = refreshMutex.withLock {
-        if (!hasRequiredCredentials()) return@withLock false
+        val clientId = getEffectiveClientId(profileId)
+        if (clientId.isBlank()) return@withLock false
         val refreshToken = authState.refreshToken?.takeIf { it.isNotBlank() }
             ?: return@withLock false
 
@@ -391,9 +519,7 @@ object TraktAuthRepository : TrackingAuthProvider {
         val body = json.encodeToString(
             TraktRefreshTokenRequest(
                 refreshToken = refreshToken,
-                clientId = TraktConfig.CLIENT_ID,
-                clientSecret = TraktConfig.CLIENT_SECRET,
-                redirectUri = TraktConfig.REDIRECT_URI,
+                clientId = clientId,
             ),
         )
 
@@ -405,6 +531,8 @@ object TraktAuthRepository : TrackingAuthProvider {
                 headers = mapOf(
                     "Accept" to "application/json",
                     "Content-Type" to "application/json",
+                    "trakt-api-version" to API_VERSION,
+                    "trakt-api-key" to clientId,
                 ),
             )
         }.onFailure { error ->
@@ -448,7 +576,9 @@ object TraktAuthRepository : TrackingAuthProvider {
     }
 
     private fun invalidateCredentials(profileId: Int) {
-        authState = TraktAuthState()
+        activePollingJob?.cancel()
+        activePollingJob = null
+        authState = TraktAuthState(customClientId = authState.customClientId)
         persist(profileId)
         publish(
             isLoading = false,
@@ -474,10 +604,15 @@ object TraktAuthRepository : TrackingAuthProvider {
         publish(statusMessage = null, errorMessage = null)
     }
 
-    private fun clearPendingAuthorization() {
+    private fun clearDeviceCode() {
         authState = authState.copy(
-            pendingAuthorizationState = null,
+            deviceCode = null,
+            userCode = null,
+            verificationUrl = null,
+            intervalSeconds = null,
+            deviceCodeExpiresAtMillis = null,
             pendingAuthorizationStartedAtMillis = null,
+            pendingAuthorizationState = null,
         )
     }
 
@@ -495,7 +630,8 @@ object TraktAuthRepository : TrackingAuthProvider {
 
         val mode = when {
             authState.isAuthenticated -> TraktConnectionMode.CONNECTED
-            !authState.pendingAuthorizationState.isNullOrBlank() -> TraktConnectionMode.AWAITING_APPROVAL
+            !authState.deviceCode.isNullOrBlank() || !authState.pendingAuthorizationState.isNullOrBlank() ->
+                TraktConnectionMode.AWAITING_APPROVAL
             else -> TraktConnectionMode.DISCONNECTED
         }
 
@@ -505,6 +641,10 @@ object TraktAuthRepository : TrackingAuthProvider {
             credentialsConfigured = hasRequiredCredentials(),
             isLoading = isLoading,
             username = authState.username,
+            effectiveClientId = getEffectiveClientId(currentProfileId),
+            customClientId = authState.customClientId,
+            userCode = authState.userCode,
+            verificationUrl = authState.verificationUrl ?: DEFAULT_VERIFICATION_URL,
             tokenExpiresAtMillis = tokenExpiresAtMillis,
             pendingAuthorizationStartedAtMillis = authState.pendingAuthorizationStartedAtMillis,
             statusMessage = statusMessage,
@@ -514,20 +654,6 @@ object TraktAuthRepository : TrackingAuthProvider {
 
     private fun persist(profileId: Int = currentProfileId) {
         TraktAuthStorage.savePayload(profileId, json.encodeToString(authState))
-    }
-
-    private fun buildAuthorizationUrl(state: String): String {
-        val responseType = "code"
-        val encodedClientId = TraktConfig.CLIENT_ID.encodeURLParameter()
-        val encodedRedirectUri = TraktConfig.REDIRECT_URI.encodeURLParameter()
-        val encodedState = state.encodeURLParameter()
-        return "$AUTHORIZE_URL?response_type=$responseType&client_id=$encodedClientId&redirect_uri=$encodedRedirectUri&state=$encodedState"
-    }
-
-    private fun generateOauthState(): String {
-        val nowPart = TraktPlatformClock.nowEpochMs().toString(16)
-        val randomPart = Random.nextLong().toULong().toString(16)
-        return "$nowPart$randomPart"
     }
 
     private fun isTokenExpiredOrExpiring(state: TraktAuthState): Boolean {
@@ -554,20 +680,21 @@ internal fun traktTokenRefreshResponseAction(status: Int): TraktTokenRefreshResp
 }
 
 @Serializable
-private data class TraktAuthorizationCodeRequest(
+private data class TraktDeviceCodeRequest(
+    @SerialName("client_id") val clientId: String,
+)
+
+@Serializable
+private data class TraktDeviceTokenRequest(
     @SerialName("code") val code: String,
     @SerialName("client_id") val clientId: String,
-    @SerialName("client_secret") val clientSecret: String,
-    @SerialName("redirect_uri") val redirectUri: String,
-    @SerialName("grant_type") val grantType: String = "authorization_code",
 )
 
 @Serializable
 private data class TraktRefreshTokenRequest(
     @SerialName("refresh_token") val refreshToken: String,
     @SerialName("client_id") val clientId: String,
-    @SerialName("client_secret") val clientSecret: String,
-    @SerialName("redirect_uri") val redirectUri: String,
+    @SerialName("redirect_uri") val redirectUri: String = "urn:ietf:wg:oauth:2.0:oob",
     @SerialName("grant_type") val grantType: String = "refresh_token",
 )
 
@@ -575,7 +702,6 @@ private data class TraktRefreshTokenRequest(
 private data class TraktRevokeRequest(
     @SerialName("token") val token: String,
     @SerialName("client_id") val clientId: String,
-    @SerialName("client_secret") val clientSecret: String,
 )
 
 @Serializable

@@ -320,14 +320,9 @@ internal fun AppGate(
                 }
             }
             is AuthState.Unauthenticated -> {
-                if (allowCachedProfileAccess) {
-                    enterProfileGate(cachedProfiles, syncOnEnter = false)
-                } else {
-                    ProfileRepository.clearInMemory()
-                    profileSelectionLoading = false
-                    profileSelectionTransitionActive = false
-                    gateScreen = AppGateScreen.Auth.name
-                }
+                // Until Mediahub authentication is added, always continue locally.
+                AuthRepository.signInAnonymously()
+                gateScreen = AppGateScreen.Loading.name
             }
             is AuthState.Authenticated -> {
                 val authenticatedState = authState as AuthState.Authenticated

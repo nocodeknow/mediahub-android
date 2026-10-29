@@ -1,5 +1,6 @@
 package com.nuvio.app.features.trakt
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -11,6 +12,12 @@ data class TraktAuthState(
     val expiresIn: Int? = null,
     val username: String? = null,
     val userSlug: String? = null,
+    val customClientId: String? = null,
+    val deviceCode: String? = null,
+    val userCode: String? = null,
+    val verificationUrl: String? = null,
+    val intervalSeconds: Int? = null,
+    val deviceCodeExpiresAtMillis: Long? = null,
     val pendingAuthorizationState: String? = null,
     val pendingAuthorizationStartedAtMillis: Long? = null,
 ) {
@@ -29,10 +36,45 @@ data class TraktAuthUiState(
     val credentialsConfigured: Boolean = true,
     val isLoading: Boolean = false,
     val username: String? = null,
+    val effectiveClientId: String = "",
+    val customClientId: String? = null,
+    val userCode: String? = null,
+    val verificationUrl: String? = null,
     val tokenExpiresAtMillis: Long? = null,
     val pendingAuthorizationStartedAtMillis: Long? = null,
     val statusMessage: String? = null,
     val errorMessage: String? = null,
+)
+
+enum class TraktDeviceTokenPollResult {
+    SUCCESS,
+    PENDING,
+    INVALID_CODE,
+    ALREADY_USED,
+    EXPIRED,
+    DENIED,
+    SLOW_DOWN,
+    TRANSIENT_ERROR,
+}
+
+fun classifyTraktDeviceTokenStatus(statusCode: Int): TraktDeviceTokenPollResult = when (statusCode) {
+    200 -> TraktDeviceTokenPollResult.SUCCESS
+    400 -> TraktDeviceTokenPollResult.PENDING
+    404 -> TraktDeviceTokenPollResult.INVALID_CODE
+    409 -> TraktDeviceTokenPollResult.ALREADY_USED
+    410 -> TraktDeviceTokenPollResult.EXPIRED
+    418 -> TraktDeviceTokenPollResult.DENIED
+    429 -> TraktDeviceTokenPollResult.SLOW_DOWN
+    else -> TraktDeviceTokenPollResult.TRANSIENT_ERROR
+}
+
+@Serializable
+data class TraktDeviceCodeResponse(
+    @SerialName("device_code") val deviceCode: String,
+    @SerialName("user_code") val userCode: String,
+    @SerialName("verification_url") val verificationUrl: String,
+    @SerialName("expires_in") val expiresIn: Int,
+    @SerialName("interval") val interval: Int,
 )
 
 enum class TraktBrandAsset {

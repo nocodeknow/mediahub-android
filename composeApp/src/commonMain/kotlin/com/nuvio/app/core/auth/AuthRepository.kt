@@ -50,34 +50,9 @@ object AuthRepository {
             )
         }
 
-        sessionStatusJob = scope.launch {
-            SupabaseProvider.client.auth.sessionStatus.collect { status ->
-                if (AuthStorage.loadAnonymousUserId() != null) return@collect
-                when (status) {
-                    is SessionStatus.Authenticated -> {
-                        val user = status.session.user
-                        val userId = user?.id.orEmpty()
-                        if (!validateRemoteSession(userId)) return@collect
-                        _state.value = AuthState.Authenticated(
-                            userId = userId,
-                            email = user?.email,
-                            isAnonymous = false,
-                        )
-                    }
-                    is SessionStatus.NotAuthenticated -> {
-                        _state.value = AuthState.Unauthenticated
-                    }
-                    is SessionStatus.Initializing -> {
-                        if (AuthStorage.loadAnonymousUserId() == null) {
-                            _state.value = AuthState.Loading
-                        }
-                    }
-                    is SessionStatus.RefreshFailure -> {
-                        _state.value = AuthState.Unauthenticated
-                    }
-                }
-            }
-        }
+        // Mediahub temporarily uses Nuvio's local guest session without a sign-in gate.
+        // Keep the persisted identity stable across launches; no cloud credentials are used.
+        if (savedAnonId == null) signInAnonymously()
     }
 
     private suspend fun validateRemoteSession(userId: String): Boolean {

@@ -692,7 +692,7 @@ object PartyRepository {
         )
     }
 
-    private const val DEFAULT_NAME = "Nuvio"
+    private const val DEFAULT_NAME = "Mediahub"
     private val COLOR_PATTERN = Regex("^#[0-9A-Fa-f]{6}$")
     private val HEARTBEAT_INTERVAL = 2.minutes
     private val PERSIST_DELAY = 1.5.seconds

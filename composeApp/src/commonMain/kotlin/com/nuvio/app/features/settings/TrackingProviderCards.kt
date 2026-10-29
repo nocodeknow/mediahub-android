@@ -34,6 +34,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -53,8 +55,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -124,7 +128,7 @@ import nuvio.composeapp.generated.resources.settings_trakt_sign_in_description
 import org.jetbrains.compose.resources.stringResource
 
 internal enum class TrackingBrand(val displayName: String) {
-    NUVIO("Nuvio"),
+    NUVIO("Mediahub"),
     TRAKT("Trakt"),
     SIMKL("Simkl"),
     MDBLIST("MDBList"),
@@ -216,6 +220,9 @@ private fun TraktProviderCard(
     uiState: TraktAuthUiState,
     modifier: Modifier,
 ) {
+    val clipboardManager = LocalClipboardManager.current
+    var copiedCode by rememberSaveable { mutableStateOf(false) }
+
     TrackingProviderCard(
         brand = TrackingBrand.TRAKT,
         mode = uiState.mode.toTrackingConnectionCardMode(),
@@ -228,15 +235,31 @@ private fun TraktProviderCard(
         connectedDescription = stringResource(Res.string.settings_trakt_save_actions_description),
         signInDescription = stringResource(Res.string.settings_trakt_sign_in_description),
         finishSignInLabel = stringResource(Res.string.settings_trakt_finish_sign_in),
-        approvalDescription = stringResource(Res.string.settings_trakt_approval_redirect),
+        approvalDescription = if (!uiState.userCode.isNullOrBlank()) {
+            "Enter this code at ${uiState.verificationUrl} to authorize Mediahub:"
+        } else {
+            stringResource(Res.string.settings_trakt_approval_redirect)
+        },
+        authorizationCode = uiState.userCode,
         connectLabel = stringResource(Res.string.settings_trakt_connect),
         openLoginLabel = stringResource(Res.string.settings_trakt_open_login),
         disconnectLabel = stringResource(Res.string.settings_trakt_disconnect),
         missingCredentialsMessage = stringResource(Res.string.settings_trakt_missing_credentials),
-        statusMessage = uiState.statusMessage.takeUnless {
+        statusMessage = if (copiedCode) "Code copied to clipboard" else uiState.statusMessage.takeUnless {
             uiState.mode == TraktConnectionMode.CONNECTED
         },
         errorMessage = uiState.errorMessage,
+        copyCodeAction = uiState.userCode?.takeIf(String::isNotBlank)?.let { code ->
+            {
+                clipboardManager.setText(AnnotatedString(code))
+                copiedCode = true
+            }
+        },
+        customClientId = uiState.customClientId,
+        effectiveClientId = uiState.effectiveClientId,
+        onCustomClientIdChanged = { newId ->
+            TraktAuthRepository.setCustomClientId(newId)
+        },
         onConnectRequested = TraktAuthRepository::onConnectRequested,
         onResumeAuthorization = {
             TraktAuthRepository.pendingAuthorizationUrl()
@@ -317,6 +340,10 @@ internal fun TrackingProviderCard(
     errorMessage: String? = null,
     websiteLabel: String? = null,
     websiteUrl: String? = null,
+    copyCodeAction: (() -> Unit)? = null,
+    customClientId: String? = null,
+    effectiveClientId: String? = null,
+    onCustomClientIdChanged: ((String) -> Unit)? = null,
     onConnectRequested: suspend () -> String?,
     onResumeAuthorization: suspend () -> String?,
     onCancelAuthorization: () -> Unit,
@@ -462,7 +489,30 @@ internal fun TrackingProviderCard(
                                 color = Color.White.copy(alpha = 0.78f),
                             )
                             authorizationCode?.let { code ->
-                                Text(code, style = MaterialTheme.typography.headlineSmall, color = Color.White)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = code,
+                                        style = MaterialTheme.typography.headlineMedium,
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                    if (copyCodeAction != null) {
+                                        OutlinedButton(
+                                            onClick = copyCodeAction,
+                                            modifier = Modifier.heightIn(min = 36.dp),
+                                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.5f)),
+                                            colors = ButtonDefaults.outlinedButtonColors(
+                                                contentColor = Color.White,
+                                            ),
+                                        ) {
+                                            Text("Copy Code")
+                                        }
+                                    }
+                                }
                             }
                             TrackingBrandPrimaryButton(
                                 label = openLoginLabel,
@@ -503,6 +553,84 @@ internal fun TrackingProviderCard(
                                     text = missingCredentialsMessage,
                                     isError = true,
                                 )
+                            }
+                        }
+                    }
+
+                    if (onCustomClientIdChanged != null && effectiveClientId != null) {
+                        var clientIdText by rememberSaveable(customClientId) {
+                            mutableStateOf(customClientId ?: "")
+                        }
+                        var showClientIdField by rememberSaveable { mutableStateOf(false) }
+
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { showClientIdField = !showClientIdField },
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "Trakt Client ID",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color.White.copy(alpha = 0.7f),
+                                )
+                                Text(
+                                    text = if (customClientId.isNullOrBlank()) "Default (prefilled)" else "Custom",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = tokens.colors.accent,
+                                )
+                            }
+                            if (showClientIdField) {
+                                OutlinedTextField(
+                                    value = clientIdText,
+                                    onValueChange = {
+                                        clientIdText = it
+                                        onCustomClientIdChanged(it)
+                                    },
+                                    placeholder = {
+                                        Text(
+                                            text = effectiveClientId,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = Color.White.copy(alpha = 0.4f),
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            text = "Public Client ID (stored with profile)",
+                                            style = MaterialTheme.typography.labelSmall,
+                                        )
+                                    },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedTextColor = Color.White,
+                                        unfocusedTextColor = Color.White.copy(alpha = 0.87f),
+                                        focusedBorderColor = Color.White.copy(alpha = 0.6f),
+                                        unfocusedBorderColor = Color.White.copy(alpha = 0.3f),
+                                        focusedLabelColor = Color.White.copy(alpha = 0.8f),
+                                        unfocusedLabelColor = Color.White.copy(alpha = 0.5f),
+                                    ),
+                                )
+                                if (!customClientId.isNullOrBlank()) {
+                                    TextButton(
+                                        onClick = {
+                                            clientIdText = ""
+                                            onCustomClientIdChanged("")
+                                        },
+                                        contentPadding = PaddingValues(0.dp),
+                                    ) {
+                                        Text(
+                                            text = "Reset to default Client ID",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = tokens.colors.accent,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
