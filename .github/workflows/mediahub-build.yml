@@ -30,6 +30,8 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: false
 
       - name: Set up Android tools
         uses: android-actions/setup-android@v3
@@ -44,7 +46,15 @@ jobs:
           touch local.properties
 
       - name: Run targeted tests
-        run: ./gradlew :composeApp:testAndroidHostTest --tests "com.nuvio.app.features.trakt.*" -Dorg.gradle.jvmargs="-Xmx3584M -XX:MaxMetaspaceSize=1024M" --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process --stacktrace
+        run: ./gradlew :composeApp:testAndroidHostTest -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore --tests "com.nuvio.app.features.trakt.*" -Dorg.gradle.jvmargs="-Xmx3584M -XX:MaxMetaspaceSize=1024M" --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process --stacktrace
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trakt-test-results
+          path: composeApp/build/test-results/testAndroidHostTest/*.xml
+          retention-days: 7
 
       - name: Build fullDebug APK
         run: ./gradlew :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore -Dorg.gradle.jvmargs="-Xmx3584M -XX:MaxMetaspaceSize=1024M" --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process --stacktrace
